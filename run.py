@@ -37,9 +37,11 @@ Notes:
 from __future__ import annotations
 
 import getpass
+import importlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -162,11 +164,94 @@ def save_config(cfg: Dict[str, Any]) -> None:
         warn(f"could not restrict permissions on {CONFIG_FILE}; secure it manually (chmod 600)")
 
 
+def _pip_is_available() -> bool:
+    """Check pip availability without importing it into this process
+    (avoids polluting sys.modules if a later reinstall needs a fresh import)."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def ensure_pip() -> bool:
+    """Bootstrap pip via the stdlib ensurepip module if it's missing.
+    ensurepip ships bundled wheels with CPython, so this normally works
+    even without network access."""
+    if _pip_is_available():
+        return True
+    info("pip not found, bootstrapping it via 'python -m ensurepip'...")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "ensurepip", "--upgrade"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        bad(f"could not bootstrap pip automatically: {e}")
+        return False
+    return _pip_is_available()
+
+
+def _pip_install_args(package: str) -> list[str]:
+    args = [sys.executable, "-m", "pip", "install"]
+    # --user is unnecessary (and sometimes problematic) inside an active
+    # virtualenv/venv, where sys.prefix differs from the base interpreter.
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if not in_venv:
+        args.append("--user")
+    args.append(package)
+    return args
+
+
+def ensure_hopx_sdk() -> bool:
+    """Install hopx-ai automatically if it isn't importable yet, then
+    (re)import it into the module-level Sandbox/APIError/ResourceLimitError
+    names used throughout the script."""
+    global Sandbox, APIError, ResourceLimitError
+    if Sandbox is not None:
+        return True
+
+    if not ensure_pip():
+        return False
+
+    info("hopx-ai SDK not found, installing it automatically (pip install hopx-ai)...")
+    try:
+        subprocess.run(_pip_install_args("hopx-ai"), check=True)
+    except subprocess.CalledProcessError as e:
+        bad(f"automatic installation of hopx-ai failed: {e}")
+        return False
+    except Exception as e:
+        bad(f"unexpected error while installing hopx-ai: {e}")
+        return False
+
+    importlib.invalidate_caches()
+    try:
+        from hopx_ai import Sandbox as _Sandbox
+        Sandbox = _Sandbox
+    except Exception as e:
+        bad(f"hopx-ai was installed but still fails to import: {e}")
+        return False
+
+    try:
+        from hopx_ai.exceptions import APIError as _APIError, ResourceLimitError as _ResourceLimitError
+        APIError, ResourceLimitError = _APIError, _ResourceLimitError
+    except Exception:
+        APIError = ResourceLimitError = Exception
+
+    ok("hopx-ai installed and loaded successfully")
+    return True
+
+
 def require_sdk() -> None:
     if Sandbox is not None:
         return
-    bad("hopx-ai SDK is not installed")
-    print("\nInstall it:")
+    if ensure_hopx_sdk():
+        return
+    bad("hopx-ai SDK could not be installed automatically")
+    print("\nInstall it manually:")
     print(color("  pip install hopx-ai", C.cyan))
     sys.exit(2)
 

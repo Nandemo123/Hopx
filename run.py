@@ -195,15 +195,47 @@ def ensure_pip() -> bool:
     return _pip_is_available()
 
 
-def _pip_install_args(package: str) -> list[str]:
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _pip_install_args(package: str, break_system: bool = False) -> list[str]:
     args = [sys.executable, "-m", "pip", "install"]
-    # --user is unnecessary (and sometimes problematic) inside an active
-    # virtualenv/venv, where sys.prefix differs from the base interpreter.
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    if not in_venv:
+    # --user is unnecessary inside an active venv. It's also actively
+    # harmful when running as root on Debian/Ubuntu-based systems (e.g.
+    # GitHub Codespaces base images): those distros patch
+    # site.ENABLE_USER_SITE to False for root, so a package installed
+    # with --user is placed under /root/.local but never added to
+    # sys.path — pip reports success, yet "import" still fails.
+    if not in_venv and not _is_root():
         args.append("--user")
+    if break_system:
+        args.append("--break-system-packages")
     args.append(package)
     return args
+
+
+def _run_pip_install(package: str) -> bool:
+    """Install `package`, retrying with --break-system-packages if the
+    environment is a PEP 668 "externally managed" system (common on
+    recent Debian/Ubuntu images)."""
+    for break_system in (False, True):
+        args = _pip_install_args(package, break_system=break_system)
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True)
+        except Exception as e:
+            bad(f"could not run pip: {e}")
+            return False
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if output:
+            print(color(output, C.dim))
+        if proc.returncode == 0:
+            return True
+        if "externally-managed-environment" not in output or break_system:
+            return False
+        warn("environment is externally managed (PEP 668); retrying with --break-system-packages")
+    return False
 
 
 def ensure_hopx_sdk() -> bool:
@@ -218,13 +250,8 @@ def ensure_hopx_sdk() -> bool:
         return False
 
     info("hopx-ai SDK not found, installing it automatically (pip install hopx-ai)...")
-    try:
-        subprocess.run(_pip_install_args("hopx-ai"), check=True)
-    except subprocess.CalledProcessError as e:
-        bad(f"automatic installation of hopx-ai failed: {e}")
-        return False
-    except Exception as e:
-        bad(f"unexpected error while installing hopx-ai: {e}")
+    if not _run_pip_install("hopx-ai"):
+        bad("automatic installation of hopx-ai failed (see output above)")
         return False
 
     importlib.invalidate_caches()
@@ -232,7 +259,11 @@ def ensure_hopx_sdk() -> bool:
         from hopx_ai import Sandbox as _Sandbox
         Sandbox = _Sandbox
     except Exception as e:
-        bad(f"hopx-ai was installed but still fails to import: {e}")
+        bad(f"hopx-ai reported a successful install but still fails to import: {e}")
+        if _is_root():
+            bad("running as root: this usually means the package was installed "
+                "under a user site-packages directory that isn't on sys.path.")
+        print(color(f"  Try: {sys.executable} -m pip install --force-reinstall hopx-ai", C.cyan))
         return False
 
     try:
